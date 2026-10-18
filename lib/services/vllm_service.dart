@@ -88,7 +88,7 @@ Future<void> vlmWorker(SendPort mainPort) async {
             New question: $question
 
             ''';
-            final conversation = await engine!.createConversation();
+            final conversation = await engine.createConversation();
             final output = StringBuffer();
             final stopwatch = Stopwatch()..start();
             try {
