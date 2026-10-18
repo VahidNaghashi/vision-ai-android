@@ -26,12 +26,13 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>UIApplicationSceneManifest</key>
 	<key>NSCameraUsageDescription</key>
 	<string>Vision AI uses the camera to analyze photos privately on your device.</string>
 
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Vision AI lets you select photos for offline AI analysis.</string>
+
+	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
