@@ -45,6 +45,20 @@ jobs:
       - name: Build for physical iPhone (unsigned)
         run: flutter build ios --release --no-codesign
 
+
+      - name: Package unsigned iPhone IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/Runner.app
+          zip -q -r VisionAI-unsigned.ipa Payload
+
+      - name: Upload iPhone IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionAI-iPhone-unsigned
+          path: VisionAI-unsigned.ipa
+          if-no-files-found: error
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
