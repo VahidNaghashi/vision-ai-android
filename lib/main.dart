@@ -21,11 +21,11 @@ class VisionApp extends StatefulWidget {
 }
 
 class _VisionAppState extends State<VisionApp> {
-  ThemeMode _mode = ThemeMode.system;
+  ThemeMode _theme = ThemeMode.system;
 
   @override
   Widget build(BuildContext context) {
-    ThemeData makeTheme(Brightness brightness) {
+    ThemeData buildTheme(Brightness brightness) {
       final dark = brightness == Brightness.dark;
       final scheme = ColorScheme.fromSeed(
         seedColor: const Color(0xFF5568DC),
@@ -37,29 +37,19 @@ class _VisionAppState extends State<VisionApp> {
         scaffoldBackgroundColor: dark
             ? const Color(0xFF0D1120)
             : const Color(0xFFF5F7FC),
-        appBarTheme: AppBarTheme(
-          backgroundColor: dark
-              ? const Color(0xFF0D1120)
-              : const Color(0xFFF5F7FC),
-          surfaceTintColor: Colors.transparent,
-        ),
         cardTheme: CardThemeData(
           elevation: 0,
           color: dark ? const Color(0xFF1A2034) : Colors.white,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(20),
           ),
         ),
         inputDecorationTheme: InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(20),
-            borderSide: BorderSide.none,
-          ),
           filled: true,
           fillColor: dark ? const Color(0xFF202740) : Colors.white,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 13,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(18),
+            borderSide: BorderSide.none,
           ),
         ),
       );
@@ -68,16 +58,14 @@ class _VisionAppState extends State<VisionApp> {
     return MaterialApp(
       title: 'Vision AI',
       debugShowCheckedModeBanner: false,
-      theme: makeTheme(Brightness.light),
-      darkTheme: makeTheme(Brightness.dark),
-      themeMode: _mode,
+      theme: buildTheme(Brightness.light),
+      darkTheme: buildTheme(Brightness.dark),
+      themeMode: _theme,
       home: VisionHomePage(
-        themeMode: _mode,
-        onToggleTheme: () {
-          setState(() {
-            _mode = _mode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
-          });
-        },
+        darkMode: _theme == ThemeMode.dark,
+        toggleTheme: () => setState(() {
+          _theme = _theme == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+        }),
       ),
     );
   }
@@ -86,43 +74,75 @@ class _VisionAppState extends State<VisionApp> {
 class VisionHomePage extends StatefulWidget {
   const VisionHomePage({
     super.key,
-    required this.themeMode,
-    required this.onToggleTheme,
+    required this.darkMode,
+    required this.toggleTheme,
   });
 
-  final ThemeMode themeMode;
-  final VoidCallback onToggleTheme;
+  final bool darkMode;
+  final VoidCallback toggleTheme;
 
   @override
   State<VisionHomePage> createState() => _VisionHomePageState();
 }
 
 class _VisionHomePageState extends State<VisionHomePage> {
-  final VlmService _vlm = VlmService();
-  final ImagePicker _picker = ImagePicker();
-  final CancelToken _downloadCancel = CancelToken();
-  final TextEditingController _question = TextEditingController();
-  final ScrollController _chatScroll = ScrollController();
+  final _vlm = VlmService();
+  final _picker = ImagePicker();
+  final _question = TextEditingController();
+  final _scroll = ScrollController();
   final List<Map<String, String>> _messages = [];
 
+  ModelSpec _selected = ModelStorage.smol;
+  CancelToken? _activeDownload;
   XFile? _image;
-  String _partialAnswer = '';
-  String _status = 'Preparing private AI...';
+  String _partial = '';
+  String _status = 'Checking saved models...';
   String? _error;
-  bool _busy = true;
   bool _ready = false;
+  bool _busy = true;
   bool _downloading = false;
   bool _analyzing = false;
   double? _progress;
-  double? _lastInferenceSeconds;
+  double? _lastSeconds;
+  final Map<VisionModel, bool> _installed = {};
 
   @override
   void initState() {
     super.initState();
-    _setupModel();
+    _restoreSelection();
   }
 
-  Future<void> _setupModel() async {
+  Future<void> _refreshInstalled() async {
+    for (final model in ModelStorage.models) {
+      final installed = await ModelStorage.isInstalled(model);
+      _installed[model.id] = installed;
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _restoreSelection() async {
+    try {
+      final id = await ModelStorage.selectedModel();
+      if (!mounted) return;
+      _selected = id == VisionModel.gemmaE2B
+          ? ModelStorage.gemma
+          : ModelStorage.smol;
+      await _refreshInstalled();
+      if (!mounted) return;
+      // First launch auto-downloads only the smaller default model.
+      // Gemma requires a confirmation before its large download.
+      await _loadSelected(autoDownload: _selected.id == VisionModel.smol);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString();
+        _status = 'Setup failed';
+      });
+    }
+  }
+
+  Future<void> _loadSelected({required bool autoDownload}) async {
     if (!mounted) return;
     setState(() {
       _busy = true;
@@ -130,18 +150,28 @@ class _VisionHomePageState extends State<VisionHomePage> {
       _downloading = false;
       _progress = null;
       _error = null;
-      _status = 'Checking saved model...';
+      _status = 'Checking ${_selected.title}...';
     });
     try {
-      var path = await ModelStorage.getInstalledModelPath();
+      String? path = await ModelStorage.installedPath(_selected);
+      if (path == null && !autoDownload) {
+        if (!mounted) return;
+        setState(() {
+          _status = '${_selected.title} is not downloaded';
+        });
+        return;
+      }
       if (path == null) {
+        final cancel = CancelToken();
+        _activeDownload = cancel;
         if (!mounted) return;
         setState(() {
           _downloading = true;
-          _status = 'Downloading SmolVLM2 • First launch';
+          _status = 'Downloading ${_selected.title}...';
         });
-        path = await ModelStorage.downloadModel(
-          cancelToken: _downloadCancel,
+        path = await ModelStorage.download(
+          _selected,
+          cancelToken: cancel,
           onProgress: (received, total) {
             if (!mounted) return;
             setState(() {
@@ -153,23 +183,25 @@ class _VisionHomePageState extends State<VisionHomePage> {
       if (!mounted) return;
       setState(() {
         _downloading = false;
-        _status = 'Initializing on-device model...';
+        _status = 'Loading ${_selected.title} into memory...';
       });
       await _vlm.loadModel(path);
       if (!mounted) return;
+      _installed[_selected.id] = true;
       setState(() {
         _ready = true;
-        _status = 'Private AI is ready';
+        _status = '${_selected.title} is ready';
       });
-    } catch (e, stack) {
-      debugPrint('Model setup failed: $e');
-      debugPrintStack(stackTrace: stack);
+    } catch (e, trace) {
+      debugPrint('Model load failed: $e');
+      debugPrintStack(stackTrace: trace);
       if (!mounted) return;
       setState(() {
+        _status = 'Unable to load ${_selected.title}';
         _error = e.toString();
-        _status = 'Model setup failed';
       });
     } finally {
+      _activeDownload = null;
       if (mounted) {
         setState(() {
           _busy = false;
@@ -179,7 +211,50 @@ class _VisionHomePageState extends State<VisionHomePage> {
     }
   }
 
-  Future<void> _chooseImage(ImageSource source) async {
+  Future<void> _switchModel(ModelSpec next) async {
+    if (_busy || next.id == _selected.id) return;
+    final installed = await ModelStorage.isInstalled(next);
+    if (!mounted) return;
+    bool downloadNow = false;
+    if (!installed) {
+      final allowed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('Download ${next.title}?'),
+          content: Text(
+            'This model uses ${next.sizeLabel} of download data and '
+            'additional temporary storage during installation. '
+            'Use Wi-Fi and ensure sufficient free space. '
+            'Inference remains on-device after installation.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Download'),
+            ),
+          ],
+        ),
+      );
+      if (allowed != true || !mounted) return;
+      downloadNow = true;
+    }
+    setState(() {
+      _selected = next;
+      _messages.clear();
+      _partial = '';
+      _lastSeconds = null;
+      _question.clear();
+    });
+    await ModelStorage.saveSelectedModel(next.id);
+    if (!mounted) return;
+    await _loadSelected(autoDownload: downloadNow);
+  }
+
+  Future<void> _pickImage(ImageSource source) async {
     if (_busy) return;
     try {
       final image = await _picker.pickImage(
@@ -187,80 +262,77 @@ class _VisionHomePageState extends State<VisionHomePage> {
         maxWidth: 1024,
         imageQuality: 85,
       );
-      if (!mounted || image == null) return;
+      if (image == null || !mounted) return;
       setState(() {
         _image = image;
         _messages.clear();
-        _partialAnswer = '';
-        _lastInferenceSeconds = null;
+        _partial = '';
+        _lastSeconds = null;
         _error = null;
         _question.text = 'Describe this image in one sentence.';
       });
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = 'Image selection failed: $e');
+      if (mounted) setState(() => _error = 'Cannot open photo: $e');
     }
   }
 
-  void _scrollToBottom() {
+  void _scrollDown() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_chatScroll.hasClients) return;
-      _chatScroll.animateTo(
-        _chatScroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 180),
+      if (!mounted || !_scroll.hasClients) return;
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 150),
         curve: Curves.easeOut,
       );
     });
   }
 
   Future<void> _sendQuestion() async {
-    if (_busy || !_ready || _image == null) return;
-    final text = _question.text.trim();
-    if (text.isEmpty) return;
-    final history = _messages.map((m) => Map<String, String>.from(m)).toList();
+    if (!_ready || _busy || _image == null) return;
+    final question = _question.text.trim();
+    if (question.isEmpty) return;
+    final history = _messages.map((e) => Map<String, String>.from(e)).toList();
     setState(() {
       _busy = true;
       _analyzing = true;
+      _partial = '';
       _error = null;
-      _partialAnswer = '';
-      _lastInferenceSeconds = null;
-      _messages.add({'role': 'user', 'text': text});
+      _lastSeconds = null;
+      _messages.add({'role': 'user', 'text': question});
       _question.clear();
     });
-    _scrollToBottom();
+    _scrollDown();
     await WidgetsBinding.instance.endOfFrame;
     if (!mounted) return;
     final watch = Stopwatch()..start();
     try {
       final answer = await _vlm.analyzeImage(
         imagePath: _image!.path,
-        question: text,
+        question: question,
         history: history,
         onToken: (fragment) {
           if (!mounted) return;
-          setState(() => _partialAnswer += fragment);
-          _scrollToBottom();
+          setState(() => _partial += fragment);
+          _scrollDown();
         },
       );
       watch.stop();
       if (!mounted) return;
       setState(() {
         _messages.add({'role': 'assistant', 'text': answer});
-        _partialAnswer = '';
-        _lastInferenceSeconds = watch.elapsedMilliseconds / 1000;
+        _partial = '';
+        _lastSeconds = watch.elapsedMilliseconds / 1000;
       });
-      _scrollToBottom();
-    } catch (e, stack) {
-      debugPrint('Inference error: $e');
-      debugPrintStack(stackTrace: stack);
+      _scrollDown();
+    } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = 'Analysis failed: $e';
-        _partialAnswer = '';
+        _error = 'Generation failed: $e';
+        _partial = '';
         if (_messages.isNotEmpty && _messages.last['role'] == 'user') {
           _messages.removeLast();
         }
-        _question.text = text;
+        _question.text = question;
       });
     } finally {
       if (mounted) {
@@ -272,489 +344,343 @@ class _VisionHomePageState extends State<VisionHomePage> {
     }
   }
 
-  void _newChat() {
-    if (_busy) return;
-    setState(() {
-      _messages.clear();
-      _partialAnswer = '';
-      _lastInferenceSeconds = null;
-      _error = null;
-      _question.clear();
-    });
-  }
-
-  Widget _statusCard(ColorScheme scheme) {
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(15),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(9),
-                  decoration: BoxDecoration(
-                    color: (_ready ? const Color(0xFF1E9C77) : scheme.primary)
-                        .withValues(alpha: 0.11),
-                    borderRadius: BorderRadius.circular(13),
-                  ),
-                  child: Icon(
-                    _ready ? Icons.verified_outlined : Icons.memory_outlined,
-                    color: _ready ? const Color(0xFF1E9C77) : scheme.primary,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _status,
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        _ready
-                            ? 'SmolVLM2-500M • On-device inference'
-                            : 'SmolVLM2-500M • Getting ready',
-                        style: TextStyle(
-                          color: scheme.onSurfaceVariant,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (_ready)
-                  const Icon(Icons.wifi_off_rounded, color: Color(0xFF1E9C77)),
-              ],
-            ),
-            if (_downloading) ...[
-              const SizedBox(height: 15),
-              LinearProgressIndicator(value: _progress, minHeight: 6),
-              const SizedBox(height: 7),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  _progress == null
-                      ? 'Downloading model...'
-                      : '${(_progress! * 100).toStringAsFixed(1)}% downloaded',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ),
-            ] else if (_busy && !_ready) ...[
-              const SizedBox(height: 12),
-              const LinearProgressIndicator(),
-            ],
-            if (_error != null && !_busy && !_ready) ...[
-              const SizedBox(height: 10),
-              SelectableText(_error!, style: TextStyle(color: scheme.error)),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  onPressed: _setupModel,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Try again'),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _photoCard(ColorScheme scheme) {
-    return Card(
-      margin: EdgeInsets.zero,
-      clipBehavior: Clip.antiAlias,
+  Widget _modelCard(ColorScheme colors) => Card(
+    margin: EdgeInsets.zero,
+    child: Padding(
+      padding: const EdgeInsets.all(14),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: double.infinity,
-            height: 185,
-            child: _image == null
-                ? Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        Icons.image_search_rounded,
-                        size: 45,
-                        color: scheme.primary.withValues(alpha: 0.75),
-                      ),
-                      const SizedBox(height: 9),
-                      const Text(
-                        'See more in every photo',
-                        style: TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Take a photo or choose from your library',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  )
-                : Image.file(File(_image!.path), fit: BoxFit.contain),
+          Row(
+            children: [
+              Icon(
+                _ready ? Icons.verified_rounded : Icons.memory_rounded,
+                color: _ready ? Colors.green : colors.primary,
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                  _status,
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              if (_ready) const Icon(Icons.wifi_off_rounded, size: 18),
+            ],
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _busy
-                        ? null
-                        : () => _chooseImage(ImageSource.camera),
-                    icon: const Icon(Icons.photo_camera_outlined, size: 19),
-                    label: const Text('Camera'),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _busy
-                        ? null
-                        : () => _chooseImage(ImageSource.gallery),
-                    icon: const Icon(Icons.photo_library_outlined, size: 19),
-                    label: const Text('Photos'),
-                  ),
-                ),
-              ],
+          const SizedBox(height: 12),
+          DropdownButtonFormField<VisionModel>(
+            key: ValueKey(_selected.id),
+            initialValue: _selected.id,
+            decoration: const InputDecoration(
+              labelText: 'On-device vision model',
+              isDense: true,
+              prefixIcon: Icon(Icons.tune_rounded),
             ),
+            items: ModelStorage.models.map((model) {
+              final downloaded = _installed[model.id] == true;
+              return DropdownMenuItem(
+                value: model.id,
+                child: Text(
+                  '${model.title} (${model.sizeLabel})${downloaded ? ' ✓' : ''}',
+                  overflow: TextOverflow.ellipsis,
+                ),
+              );
+            }).toList(),
+            onChanged: _busy
+                ? null
+                : (value) {
+                    if (value == null) return;
+                    final spec = ModelStorage.models.firstWhere(
+                      (model) => model.id == value,
+                    );
+                    _switchModel(spec);
+                  },
           ),
+          if (_downloading) ...[
+            const SizedBox(height: 12),
+            LinearProgressIndicator(value: _progress),
+            const SizedBox(height: 5),
+            Text(
+              _progress == null
+                  ? 'Downloading and preparing model...'
+                  : '${(_progress! * 100).toStringAsFixed(1)}% downloaded',
+              style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant),
+            ),
+          ] else if (_busy && !_ready) ...[
+            const SizedBox(height: 12),
+            const LinearProgressIndicator(),
+          ],
+          if (_error != null && !_busy && !_ready) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: TextStyle(color: colors.error)),
+            TextButton.icon(
+              onPressed: () => _loadSelected(autoDownload: true),
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          ],
         ],
       ),
-    );
-  }
+    ),
+  );
 
-  Widget _bubble(
-    Map<String, String> entry,
-    bool generating,
-    ColorScheme scheme,
-  ) {
-    final user = entry['role'] == 'user';
-    final text = entry['text'] ?? '';
-    return Align(
-      alignment: user ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.sizeOf(context).width * 0.84,
+  Widget _photoCard(ColorScheme colors) => Card(
+    margin: EdgeInsets.zero,
+    clipBehavior: Clip.antiAlias,
+    child: Column(
+      children: [
+        SizedBox(
+          height: 185,
+          width: double.infinity,
+          child: _image == null
+              ? Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.image_search_rounded,
+                      size: 48,
+                      color: colors.primary,
+                    ),
+                    const SizedBox(height: 10),
+                    const Text('Add a photo to begin'),
+                  ],
+                )
+              : Image.file(File(_image!.path), fit: BoxFit.contain),
         ),
-        padding: const EdgeInsets.fromLTRB(14, 11, 14, 9),
-        margin: const EdgeInsets.symmetric(vertical: 5),
-        decoration: BoxDecoration(
-          color: user ? scheme.primaryContainer : scheme.surface,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(19),
-            topRight: const Radius.circular(19),
-            bottomLeft: Radius.circular(user ? 19 : 5),
-            bottomRight: Radius.circular(user ? 5 : 19),
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (!user) ...[
-                  Icon(
-                    Icons.auto_awesome_rounded,
-                    size: 14,
-                    color: scheme.primary,
-                  ),
-                  const SizedBox(width: 5),
-                ],
-                Text(
-                  user ? 'You' : 'Vision AI',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    color: user ? scheme.onPrimaryContainer : scheme.primary,
-                  ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _busy
+                      ? null
+                      : () => _pickImage(ImageSource.camera),
+                  icon: const Icon(Icons.camera_alt_outlined),
+                  label: const Text('Camera'),
                 ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Text(
-              generating && text.isEmpty
-                  ? 'Thinking about your photo...'
-                  : text,
-              style: const TextStyle(fontSize: 15, height: 1.45),
-            ),
-            if (generating) ...[
-              const SizedBox(height: 9),
-              const SizedBox(
-                width: 13,
-                height: 13,
-                child: CircularProgressIndicator(strokeWidth: 2),
               ),
-            ] else if (!user && text.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Align(
-                alignment: Alignment.centerRight,
-                child: IconButton(
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Copy answer',
-                  icon: const Icon(Icons.copy_rounded, size: 17),
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: text));
-                    if (!mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Answer copied')),
-                    );
-                  },
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _busy
+                      ? null
+                      : () => _pickImage(ImageSource.gallery),
+                  icon: const Icon(Icons.photo_library_outlined),
+                  label: const Text('Photos'),
                 ),
               ),
             ],
-          ],
+          ),
         ),
-      ),
-    );
-  }
+      ],
+    ),
+  );
 
-  Widget _conversation(ColorScheme scheme) {
+  Widget _chat(ColorScheme colors) {
     final entries = <Map<String, String>>[
       ..._messages,
-      if (_analyzing) {'role': 'assistant', 'text': _partialAnswer},
+      if (_analyzing) {'role': 'assistant', 'text': _partial},
     ];
     if (entries.isEmpty) {
       return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.forum_outlined,
-              size: 35,
-              color: scheme.onSurfaceVariant.withValues(alpha: 0.6),
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              'Your conversation starts here',
-              style: TextStyle(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 5),
-            Text(
-              'Choose a photo, then ask anything about it.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
-            ),
-          ],
+        child: Text(
+          'Ask questions about the selected image.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: colors.onSurfaceVariant),
         ),
       );
     }
     return ListView.builder(
-      controller: _chatScroll,
-      padding: const EdgeInsets.symmetric(vertical: 10),
+      controller: _scroll,
+      padding: const EdgeInsets.symmetric(vertical: 8),
       itemCount: entries.length,
-      itemBuilder: (context, index) => _bubble(
-        entries[index],
-        _analyzing && index == entries.length - 1,
-        scheme,
-      ),
-    );
-  }
-
-  Widget _composer(ColorScheme scheme) {
-    final enabled = _ready && !_busy && _image != null;
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        border: Border(
-          top: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
-        ),
-      ),
-      padding: EdgeInsets.fromLTRB(
-        16,
-        9,
-        16,
-        MediaQuery.paddingOf(context).bottom > 0 ? 7 : 13,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (_image != null)
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _suggestion(
-                    'Describe',
-                    'Describe this image in one sentence.',
-                  ),
-                  const SizedBox(width: 7),
-                  _suggestion('Objects', 'What objects are visible?'),
-                  const SizedBox(width: 7),
-                  _suggestion('Read text', 'Read the visible text.'),
-                ],
-              ),
+      itemBuilder: (context, index) {
+        final item = entries[index];
+        final isUser = item['role'] == 'user';
+        final isStreaming = _analyzing && index == entries.length - 1;
+        final text = item['text'] ?? '';
+        return Align(
+          alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+          child: Container(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.sizeOf(context).width * 0.83,
             ),
-          if (_image != null) const SizedBox(height: 8),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _question,
-                  enabled: !_busy,
-                  minLines: 1,
-                  maxLines: 3,
-                  textCapitalization: TextCapitalization.sentences,
-                  textInputAction: TextInputAction.send,
-                  decoration: InputDecoration(
-                    hintText: _image == null
-                        ? 'Add a photo to start...'
-                        : 'Ask about this photo...',
-                    prefixIcon: const Icon(
-                      Icons.chat_bubble_outline_rounded,
-                      size: 20,
+            margin: const EdgeInsets.symmetric(vertical: 5),
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: isUser ? colors.primaryContainer : colors.surface,
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isUser ? 'You' : _selected.title,
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                    color: colors.primary,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(isStreaming && text.isEmpty ? 'Thinking...' : text),
+                if (isStreaming) ...[
+                  const SizedBox(height: 8),
+                  const SizedBox(
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ],
+                if (!isUser && !isStreaming && text.isNotEmpty)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: IconButton(
+                      tooltip: 'Copy answer',
+                      icon: const Icon(Icons.copy_rounded, size: 17),
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: text));
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Answer copied')),
+                        );
+                      },
                     ),
                   ),
-                  onSubmitted: (_) => _sendQuestion(),
-                ),
-              ),
-              const SizedBox(width: 9),
-              IconButton.filled(
-                tooltip: 'Send question',
-                onPressed: enabled ? _sendQuestion : null,
-                icon: Icon(
-                  _analyzing
-                      ? Icons.hourglass_top_rounded
-                      : Icons.arrow_upward_rounded,
-                ),
-                style: IconButton.styleFrom(minimumSize: const Size(49, 49)),
-              ),
-            ],
-          ),
-          if (_error != null && _ready)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                _error!,
-                style: TextStyle(fontSize: 12, color: scheme.error),
-              ),
+              ],
             ),
-        ],
-      ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _suggestion(String label, String prompt) => ActionChip(
-    label: Text(label),
-    visualDensity: VisualDensity.compact,
-    onPressed: _busy
-        ? null
-        : () {
-            _question.text = prompt;
-            _question.selection = TextSelection.collapsed(
-              offset: prompt.length,
-            );
-          },
+  Widget _composer(ColorScheme colors) => Container(
+    padding: const EdgeInsets.fromLTRB(15, 10, 15, 10),
+    decoration: BoxDecoration(
+      color: Theme.of(context).scaffoldBackgroundColor,
+      border: Border(top: BorderSide(color: colors.outlineVariant)),
+    ),
+    child: SafeArea(
+      top: false,
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _question,
+              minLines: 1,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                hintText: 'Ask Vision AI about this photo...',
+                isDense: true,
+              ),
+              onSubmitted: (_) => _sendQuestion(),
+            ),
+          ),
+          const SizedBox(width: 9),
+          IconButton.filled(
+            tooltip: 'Send question',
+            onPressed: _ready && !_busy && _image != null
+                ? _sendQuestion
+                : null,
+            icon: const Icon(Icons.arrow_upward_rounded),
+          ),
+        ],
+      ),
+    ),
   );
 
   @override
   void dispose() {
-    _downloadCancel.cancel('App closed');
+    _activeDownload?.cancel('App closing');
     _question.dispose();
-    _chatScroll.dispose();
+    _scroll.dispose();
     _vlm.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final colors = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
-        titleSpacing: 18,
-        title: Column(
+        title: const Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Vision AI',
-              style: TextStyle(
-                fontWeight: FontWeight.w800,
-                letterSpacing: -0.6,
-              ),
-            ),
+            Text('Vision AI', style: TextStyle(fontWeight: FontWeight.bold)),
             Text(
-              'Your private visual assistant',
-              style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+              'Private on-device visual assistant',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.normal),
             ),
           ],
         ),
         actions: [
           IconButton(
             tooltip: 'New conversation',
-            onPressed: _busy ? null : _newChat,
+            onPressed: _busy
+                ? null
+                : () => setState(() {
+                    _messages.clear();
+                    _partial = '';
+                    _question.clear();
+                    _lastSeconds = null;
+                  }),
             icon: const Icon(Icons.edit_square),
           ),
           IconButton(
-            tooltip: 'Toggle light / dark mode',
-            onPressed: widget.onToggleTheme,
+            tooltip: 'Toggle dark mode',
+            onPressed: widget.toggleTheme,
             icon: Icon(
-              widget.themeMode == ThemeMode.dark
+              widget.darkMode
                   ? Icons.light_mode_outlined
                   : Icons.dark_mode_outlined,
             ),
           ),
-          const SizedBox(width: 7),
         ],
       ),
       body: Column(
         children: [
           Expanded(
             child: ListView(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
               children: [
-                _statusCard(scheme),
+                _modelCard(colors),
                 const SizedBox(height: 12),
-                _photoCard(scheme),
-                const SizedBox(height: 17),
+                _photoCard(colors),
+                const SizedBox(height: 18),
                 Row(
                   children: [
                     const Text(
                       'Conversation',
                       style: TextStyle(
-                        fontWeight: FontWeight.w800,
                         fontSize: 18,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
                     const Spacer(),
-                    if (_lastInferenceSeconds != null)
+                    if (_lastSeconds != null)
                       Text(
-                        '${_lastInferenceSeconds!.toStringAsFixed(1)} s',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: scheme.onSurfaceVariant,
-                        ),
+                        '${_lastSeconds!.toStringAsFixed(1)} s',
+                        style: TextStyle(color: colors.onSurfaceVariant),
                       ),
                   ],
                 ),
                 const SizedBox(height: 8),
-                SizedBox(height: 280, child: _conversation(scheme)),
+                SizedBox(height: 290, child: _chat(colors)),
                 const SizedBox(height: 9),
-                Center(
-                  child: Text(
-                    'Powered by SmolVLM2 • Images stay on this device',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: scheme.onSurfaceVariant,
-                    ),
+                Text(
+                  'All image inference runs on your device.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: colors.onSurfaceVariant,
                   ),
                 ),
               ],
             ),
           ),
-          _composer(scheme),
+          _composer(colors),
         ],
       ),
     );
