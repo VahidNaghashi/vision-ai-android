@@ -50,7 +50,7 @@ class ModelStorage {
     minimumBytes: 2 * 1024 * 1024 * 1024,
     sizeLabel: '~2.59 GB',
     sha256Hex:
-        '181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c',
+        'ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42',
   );
 
   static const models = [smol, gemma];
@@ -96,6 +96,15 @@ class ModelStorage {
   static Future<bool> isInstalled(ModelSpec model) async =>
       await installedPath(model) != null;
 
+  static final RegExp _contentRangePattern = RegExp(r'^bytes (\d+)-(\d+)/(\d+)$');
+
+  static int? _contentLength(Headers headers) {
+    return int.tryParse(headers.value(Headers.contentLengthHeader) ?? '');
+  }
+
+  /// Downloads to a persistent .download file. Only a size-checked and (where
+  /// configured) SHA-256 verified file is promoted to its final model path.
+  /// A failed/cancelled transfer retains its bytes for the next attempt.
   static Future<String> download(
     ModelSpec model, {
     required void Function(int received, int total) onProgress,
@@ -112,38 +121,138 @@ class ModelStorage {
         receiveTimeout: const Duration(minutes: 5),
         followRedirects: true,
         maxRedirects: 10,
+        // Keep 416 for our explicit recovery path.
+        validateStatus: (status) =>
+            status != null && ((status >= 200 && status < 300) || status == 416),
       ),
     );
+
     try {
-      if (await partial.exists()) await partial.delete();
-      await dio.download(
-        model.url,
-        partial.path,
-        cancelToken: cancelToken,
-        onReceiveProgress: onProgress,
-      );
-      if (await partial.length() < model.minimumBytes) {
-        throw StateError('Downloaded file is smaller than expected.');
-      }
-      if (model.sha256Hex != null) {
-        final digest = await sha256.bind(partial.openRead()).first;
-        if (digest.toString().toLowerCase() != model.sha256Hex) {
-          throw StateError(
-            'SHA-256 verification failed. Try downloading again.',
-          );
+      // At most one restart if a partial file cannot be resumed.
+      for (var attempt = 0; attempt < 2; attempt++) {
+        final previousBytes = await partial.exists() ? await partial.length() : 0;
+        final response = await dio.get<ResponseBody>(
+          model.url,
+          options: Options(
+            responseType: ResponseType.stream,
+            headers: previousBytes > 0
+                ? <String, String>{'Range': 'bytes=$previousBytes-'}
+                : null,
+          ),
+          cancelToken: cancelToken,
+        );
+        final status = response.statusCode;
+
+        if (status == 416) {
+          // May happen when an earlier transfer completed but app was killed
+          // before verification/rename. Validate the retained file first.
+          if (previousBytes >= model.minimumBytes) {
+            try {
+              await _verify(partial, model);
+              await _promote(partial, destination);
+              return destination.path;
+            } on StateError {
+              // An incorrect partial must be replaced, not appended.
+            }
+          }
+          if (attempt == 0) {
+            if (await partial.exists()) await partial.delete();
+            continue;
+          }
+          throw StateError('Server rejected download range (HTTP 416).');
         }
+
+        if (status != 200 && status != 206) {
+          throw StateError('Unexpected download status: HTTP $status');
+        }
+
+        var offset = 0;
+        int? total;
+        if (status == 206) {
+          final rawRange = response.headers.value('content-range');
+          final match = rawRange == null ? null : _contentRangePattern.firstMatch(rawRange);
+          if (match == null || previousBytes == 0 ||
+              int.parse(match.group(1)!) != previousBytes) {
+            throw StateError('Invalid Content-Range in resume response: $rawRange');
+          }
+          offset = previousBytes;
+          total = int.parse(match.group(3)!);
+        } else {
+          // Server ignored Range. Start a fresh download rather than appending
+          // duplicate data to the existing partial file.
+          total = _contentLength(response.headers);
+        }
+
+        // A streamed response must be consumed (or its connection released).
+        // RandomAccessFile lets us resume without allocating GBs in memory.
+        final sink = await partial.open(mode: offset > 0 ? FileMode.append : FileMode.write);
+        var received = offset;
+        try {
+          onProgress(received, total ?? -1);
+          await for (final chunk in response.data!.stream) {
+            if (cancelToken?.isCancelled == true) {
+              throw DioException(
+                requestOptions: response.requestOptions,
+                type: DioExceptionType.cancel,
+                error: 'Download cancelled',
+              );
+            }
+            await sink.writeFrom(chunk);
+            received += chunk.length;
+            onProgress(received, total ?? -1);
+          }
+          await sink.flush();
+        } finally {
+          await sink.close();
+        }
+
+        final size = await partial.length();
+        if (total != null && size != total) {
+          throw StateError('Transfer incomplete: $size of $total bytes. Retry to resume.');
+        }
+        await _verify(partial, model);
+        await _promote(partial, destination);
+        return destination.path;
       }
-      if (await destination.exists()) await destination.delete();
-      await partial.rename(destination.path);
-      return destination.path;
+      throw StateError('Unable to resume download. Please retry.');
     } finally {
       dio.close();
-      if (await partial.exists()) await partial.delete();
+      // Intentionally keep .download on error, cancellation or checksum failure.
     }
+  }
+
+  static Future<void> _verify(File file, ModelSpec model) async {
+    final size = await file.length();
+    if (size < model.minimumBytes) {
+      throw StateError('Downloaded file too small ($size bytes). Retry to resume.');
+    }
+    if (model.sha256Hex != null) {
+      final actual = (await sha256.bind(file.openRead()).first).toString().toLowerCase();
+      final expected = model.sha256Hex!.toLowerCase();
+      if (actual != expected) {
+        throw StateError('SHA-256 mismatch. Partial file kept for diagnosis. '
+            'Expected: $expected; actual: $actual; bytes: $size. '
+            'Use resetDownload() to discard it before redownloading.');
+      }
+    }
+  }
+
+  static Future<void> _promote(File partial, File destination) async {
+    if (await destination.exists()) await destination.delete();
+    await partial.rename(destination.path);
+  }
+
+  /// Explicitly discard the temporary file when a hash mismatch is confirmed.
+  /// Does not remove an installed, verified model.
+  static Future<void> resetDownload(ModelSpec model) async {
+    final file = await modelFile(model);
+    final partial = File('${file.path}.download');
+    if (await partial.exists()) await partial.delete();
   }
 
   static Future<void> delete(ModelSpec model) async {
     final file = await modelFile(model);
     if (await file.exists()) await file.delete();
+    await resetDownload(model);
   }
 }
